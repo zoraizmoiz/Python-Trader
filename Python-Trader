@@ -1,0 +1,208 @@
+# trader.py
+# ─────────────────────────────────────────────
+# Alpaca paper trading — auto buy, sell, rebalance
+# ─────────────────────────────────────────────
+
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest, ClosePositionRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
+import pandas as pd
+
+# ── Credentials ───────────────────────────────
+API_KEY    = "ADDKEYHERE"
+SECRET_KEY = "ADDKEYHERE"
+PAPER      = True
+
+# ── Settings ──────────────────────────────────
+TOP_N          = 10
+ALLOCATION_PCT = 0.90
+MIN_SCORE      = 45
+MIN_SIGNAL     = ["BUY", "MONITOR"]
+
+
+def get_client() -> TradingClient:
+    return TradingClient(API_KEY, SECRET_KEY, paper=PAPER)
+
+
+def get_account_info(client: TradingClient) -> dict:
+    account = client.get_account()
+    return {
+        "cash":         float(account.cash),
+        "portfolio":    float(account.portfolio_value),
+        "buying_power": float(account.buying_power),
+    }
+
+
+def get_current_positions(client: TradingClient) -> dict:
+    """
+    Returns a dict of {ticker: market_value} for all open positions.
+    """
+    positions = client.get_all_positions()
+    held = {p.symbol: float(p.market_value) for p in positions}
+    print(f"[Trader] Currently holding {len(held)} positions: {list(held.keys())}")
+    return held
+
+
+def get_top_stocks(results: pd.DataFrame) -> pd.DataFrame:
+    candidates = results[
+        (results["signal"].isin(MIN_SIGNAL)) &
+        (results["composite_score"] >= MIN_SCORE)
+    ].head(TOP_N)
+    print(f"[Trader] Top {len(candidates)} stocks from screener: {candidates['ticker'].tolist()}")
+    return candidates
+
+
+def close_position(client: TradingClient, ticker: str, dry_run: bool):
+    """
+    Sells the entire position in a stock.
+    """
+    print(f"  [SELL] {ticker}")
+    if not dry_run:
+        try:
+            client.close_position(ticker)
+            print(f"  [SELL] {ticker} — position closed successfully")
+        except Exception as e:
+            print(f"  [SELL] {ticker} — failed: {e}")
+
+
+def place_buy_order(client: TradingClient, ticker: str, dollar_amount: float, dry_run: bool):
+    """
+    Places a fractional market buy order for a given dollar amount.
+    """
+    print(f"  [BUY]  {ticker} — ${dollar_amount:,.2f}")
+    if not dry_run:
+        try:
+            order = MarketOrderRequest(
+                symbol        = ticker,
+                notional      = dollar_amount,
+                side          = OrderSide.BUY,
+                time_in_force = TimeInForce.DAY
+            )
+            result = client.submit_order(order)
+            print(f"  [BUY]  {ticker} — order accepted: {result.id}")
+        except Exception as e:
+            print(f"  [BUY]  {ticker} — failed: {e}")
+
+
+def run_rebalance(results: pd.DataFrame, dry_run: bool = False):
+    """
+    Full rebalancing logic:
+
+    1. Get current holdings from Alpaca
+    2. Get new top 10 from screener
+    3. Sell anything no longer in the top 10
+    4. Buy anything new that wasn't already held
+    5. Skip anything already held and still in top 10
+
+    Beginner: Like pruning a garden. Cut what's no longer
+              performing, plant what looks strongest now.
+
+    Advanced:  Sells first to free up cash, then buys.
+               Uses fractional notional orders so position
+               sizes are always dollar-based, not share-based.
+    """
+    print("\n── Rebalancer Starting ───────────────────")
+    if dry_run:
+        print("[Trader] DRY RUN — no real orders will be placed")
+
+    client    = get_client()
+    info      = get_account_info(client)
+    held      = get_current_positions(client)
+    top       = get_top_stocks(results)
+    top_tickers = set(top["ticker"].tolist())
+    held_tickers = set(held.keys())
+
+    # ── What needs to change? ──────────────────
+    to_sell = held_tickers - top_tickers   # Held but no longer top 10
+    to_buy  = top_tickers - held_tickers   # Top 10 but not yet held
+    to_keep = held_tickers & top_tickers   # Already held and still top 10
+
+    print(f"\n[Rebalancer] Keeping:  {sorted(to_keep)}")
+    print(f"[Rebalancer] Selling:  {sorted(to_sell)}")
+    print(f"[Rebalancer] Buying:   {sorted(to_buy)}")
+
+    # ── Step 1: Sell dropped positions ────────
+    if to_sell:
+        print(f"\n── Selling {len(to_sell)} dropped positions ──")
+        for ticker in sorted(to_sell):
+            close_position(client, ticker, dry_run)
+    else:
+        print("\n[Rebalancer] Nothing to sell.")
+
+    # ── Step 2: Calculate buying power ────────
+    # Cash + proceeds from sales
+    estimated_proceeds = sum(held.get(t, 0) for t in to_sell)
+    available_cash     = info["cash"] + estimated_proceeds
+    n_to_buy           = len(to_buy)
+
+    if n_to_buy == 0:
+        print("\n[Rebalancer] Nothing to buy — portfolio already optimal.")
+        _print_summary(to_keep, to_sell, to_buy, info)
+        return
+
+    per_stock = round((available_cash * ALLOCATION_PCT) / n_to_buy, 2)
+
+    print(f"\n── Buying {n_to_buy} new positions ──────────")
+    print(f"[Rebalancer] Available cash (est.): ${available_cash:,.2f}")
+    print(f"[Rebalancer] Per stock allocation:  ${per_stock:,.2f}")
+
+    # ── Step 3: Buy new positions ──────────────
+    for ticker in sorted(to_buy):
+        place_buy_order(client, ticker, per_stock, dry_run)
+
+    _print_summary(to_keep, to_sell, to_buy, info)
+    print("\n── Rebalancer Complete ───────────────────")
+
+
+def _print_summary(to_keep, to_sell, to_buy, info):
+    print(f"""
+── Portfolio Summary ─────────────────────
+  Kept:          {len(to_keep)} positions (no change)
+  Sold:          {len(to_sell)} positions
+  Bought:        {len(to_buy)} positions
+  Portfolio val: ${info['portfolio']:,.2f}
+  Cash:          ${info['cash']:,.2f}
+──────────────────────────────────────────""")
+
+
+def run_auto_trader(results: pd.DataFrame, dry_run: bool = False):
+    """
+    First-time buyer — use this on an empty account.
+    Buys all top 10 stocks from scratch.
+    """
+    print("\n── Auto Trader Starting ──────────────────")
+    if dry_run:
+        print("[Trader] DRY RUN — no real orders will be placed")
+
+    client    = get_client()
+    info      = get_account_info(client)
+    held      = get_current_positions(client)
+    top       = get_top_stocks(results)
+    to_buy    = top[~top["ticker"].isin(held.keys())]
+    n_to_buy  = len(to_buy)
+
+    if n_to_buy == 0:
+        print("[Trader] Already holding all top stocks.")
+        return
+
+    per_stock = round((info["cash"] * ALLOCATION_PCT) / n_to_buy, 2)
+    print(f"[Trader] Buying {n_to_buy} stocks at ${per_stock:,.2f} each")
+    print(f"[Trader] Total to deploy: ${per_stock * n_to_buy:,.2f}\n")
+
+    for _, row in to_buy.iterrows():
+        print(f"  → {row['ticker']:6s} | Score: {row['composite_score']:.1f} | Signal: {row['signal']}")
+        place_buy_order(client, row["ticker"], per_stock, dry_run)
+
+    print("\n── Auto Trader Complete ──────────────────")
+
+
+if __name__ == "__main__":
+    from screener import run_screener
+    results = run_screener()
+
+    # ── Choose your mode ──────────────────────
+    # First time (empty account):
+    # run_auto_trader(results, dry_run=False)
+
+    # Ongoing rebalancing (already have positions):
+    run_rebalance(results, dry_run=False)
